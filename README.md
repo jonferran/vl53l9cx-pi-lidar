@@ -180,7 +180,6 @@ Things that were non-obvious and are baked into the code:
 - Raw radial depth only — no calibration / radial-to-perpendicular / TNR (ST ISP)
 - Amplitude & ambient arrays are decoded off the wire but not yet displayed
 - Sensor reset is a manual power-cycle (XSHUT is hard-tied on this board)
-- Viewer render rate trails the 100 fps capture rate on the Pi 4
 
 ---
 
