@@ -1,0 +1,34 @@
+/dts-v1/;
+/plugin/;
+
+/{
+    compatible = "brcm,bcm2711";
+
+    fragment@0 {
+        target-path = "/";
+        __overlay__ {
+            vl53l9_sensor: sensor {
+                compatible = "raspberrypi,dummy-csi2-sensor";
+                status = "okay";
+                port {
+                    sensor_to_unicam: endpoint {
+                        remote-endpoint = <&unicam_to_sensor>;
+                    };
+                };
+            };
+        };
+    };
+
+    fragment@1 {
+        target = <&csi1>;
+        __overlay__ {
+            status = "okay";
+            port {
+                unicam_to_sensor: endpoint {
+                    remote-endpoint = <&sensor_to_unicam>;
+                    data-lanes = <1>;  // OVERRIDDEN TO 1 LANE
+                };
+            };
+        };
+    };
+};

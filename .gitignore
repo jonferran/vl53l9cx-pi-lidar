@@ -1,0 +1,20 @@
+# built app
+/vl53l9_bringup
+
+# kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+.*.cmd
+modules.order
+Module.symvers
+.tmp_versions/
+
+# runtime / captures / logs
+tof_pipe
+*.raw
+*.log

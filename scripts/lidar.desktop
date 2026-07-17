@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ToF LiDAR
+Comment=VL53L9CX live depth view (54x42 @ 100fps)
+Exec=lxterminal -t "VL53L9CX LiDAR" -e bash -c "$HOME/vl53l9cx-pi-lidar/run_lidar.sh; echo; echo 'Press Enter to close...'; read"
+Icon=camera-video
+Terminal=false
+Categories=Utility;
