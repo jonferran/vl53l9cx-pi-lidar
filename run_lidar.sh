@@ -30,7 +30,7 @@ echo "[+] Setting dummy subdev pad format to 100x${HEIGHT}..."
 v4l2-ctl -d /dev/v4l-subdev0 --set-subdev-fmt pad=0,width=100,height=${HEIGHT},code=0x2001 >/dev/null 2>&1
 
 echo "[+] Launching depth viewer..."
-VL_BINNING=$BIN VL_ORIENT=2 VL_PIPE=$PIPE nohup python3 viewer/visualize.py >/tmp/viz.log 2>&1 &
+VL_BINNING=$BIN VL_ORIENT=0 VL_PIPE=$PIPE nohup python3 viewer/visualize.py >/tmp/viz.log 2>&1 &
 sleep 2
 
 echo "[+] Arming V4L2 receiver (RAW8/GREY 100x${HEIGHT} -> $PIPE)..."
@@ -42,5 +42,5 @@ sudo ./vl53l9_bringup $USECASE $EXP $PERIOD $POWER $DSS 2>&1 \
   | grep -E 'vl53l9_init|profile|exposure|power|dss|readback|STREAMING|TRANSMITTER|did not'
 
 echo "[+] Live depth on the local monitor (DISPLAY=:0)."
-echo "    Keys in window: r = rotate/flip, q = quit"
+echo "    Keys: r=rotate c=channel m=colormap v=3D f=front 3=3/4view z=fullscreen l=logcolor q=quit"
 echo "    Stop everything: sudo killall -9 python3 v4l2-ctl"
