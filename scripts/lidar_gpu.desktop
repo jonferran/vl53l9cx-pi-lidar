@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ToF LiDAR (GPU Particles)
+Comment=VL53L9CX GPU-shader Perlin-noise particle view
+Exec=lxterminal -t "VL53L9CX GPU Particles" -e bash -c "$HOME/vl53l9cx-pi-lidar/run_lidar_gpu.sh; echo; echo 'Press Enter to close...'; read"
+Icon=applications-graphics
+Terminal=false
+Categories=Utility;
