@@ -114,6 +114,18 @@ class Studio:
         self._paint_last = None
         # CV object-detection overlay on the heatmap.
         self.vision_on = False
+        # Sentry: auto-record depth on motion (a privacy-friendly smart cam --
+        # it captures depth, not video). All guarded so it can never take down
+        # the reader thread.
+        self.sentry_on = False
+        self.events = collections.deque(maxlen=200)   # {t, label, dist}
+        self._sentry_rec = False
+        self._present_since = None
+        self._absent_since = None
+        self.SENTRY_QUIET = 2.0        # seconds of no motion before auto-stop
+        self.SENTRY_MAXCLIP = 120.0    # hard cap on a single sentry clip
+        self._sentry_start_t = 0.0
+        self._last_motion_log = 0.0    # debounce so flicker doesn't spam the log
 
     # -- called by the sensor thread each frame --
     def push_live(self, depth):
@@ -133,6 +145,40 @@ class Studio:
                 self.scan_frames += 1
         if self.paint_on and g.get("presence"):
             self._add_paint(g)
+        try:
+            self._sentry_step(g)
+        except Exception as e:
+            print(f"[web] sentry error (ignored): {e}", flush=True)
+
+    def _log_event(self, label, dist=0):
+        self.events.append({"t": time.time(), "label": label, "dist": int(dist)})
+
+    def _sentry_step(self, g):
+        now = time.time()
+        if not self.sentry_on:
+            if self._sentry_rec:
+                self.rec_stop(); self._sentry_rec = False
+                self._log_event("sentry off, clip saved")
+            return
+        present = bool(g.get("presence"))
+        if present:
+            self._absent_since = None
+            if self._present_since is None:
+                self._present_since = now
+                if now - self._last_motion_log > 3.0:   # debounce near-threshold flicker
+                    self._log_event("motion detected", g.get("hand_z_mm", 0))
+                    self._last_motion_log = now
+            if not self._sentry_rec and self.rec_file is None:
+                self.rec_start(); self._sentry_rec = True; self._sentry_start_t = now
+            if self._sentry_rec and now - self._sentry_start_t > self.SENTRY_MAXCLIP:
+                self.rec_stop(); self.rec_start(); self._sentry_start_t = now
+        else:
+            self._present_since = None
+            if self._absent_since is None:
+                self._absent_since = now
+            if self._sentry_rec and now - self._absent_since > self.SENTRY_QUIET:
+                self.rec_stop(); self._sentry_rec = False
+                self._log_event("clear, clip saved")
 
     def scan_start(self):
         with self.lock:
@@ -508,6 +554,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     stats["scan_ready"] = STUDIO.scan_fused is not None
                     stats["vision_on"] = STUDIO.vision_on
                     stats["objects"] = len(gesture.get("objects", []))
+                    stats["sentry_on"] = STUDIO.sentry_on
+                    stats["sentry_rec"] = STUDIO._sentry_rec
                 self._send(200, "application/json",
                            json.dumps({"stats": stats, "gesture": gesture,
                                        "recordings": STUDIO.list_recordings()}).encode())
@@ -525,6 +573,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            {"Content-Disposition": f'attachment; filename="{fn}"'})
             elif path == "/paint.bin":
                 self._send(200, "application/octet-stream", STUDIO.paint_bytes())
+            elif path == "/events.json":
+                with STUDIO.lock:
+                    evs = list(STUDIO.events)[-30:]
+                self._send(200, "application/json", json.dumps(evs).encode())
             elif path == "/scan.bin":
                 self._send(200, "application/octet-stream", STUDIO.scan_bytes())
             elif path == "/scan.ply":
@@ -575,6 +627,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif cmd == "vision_toggle":
             STUDIO.vision_on = not STUDIO.vision_on
             msg["on"] = STUDIO.vision_on
+        elif cmd == "sentry_toggle":
+            STUDIO.sentry_on = not STUDIO.sentry_on
+            STUDIO._log_event("sentry armed" if STUDIO.sentry_on else "sentry disarmed")
+            msg["on"] = STUDIO.sentry_on
         else:
             msg = {"ok": False, "error": "unknown cmd"}
         self._send(200, "application/json", json.dumps(msg).encode())
@@ -753,6 +809,18 @@ _PAGE = r"""<!doctype html>
       <div class="hint">Air-draw traces your fingertip through 3D space into the point cloud — paint a sculpture in the air, then export it.</div>
     </div>
   </div>
+
+  <div class="card">
+    <h2>Sentry &mdash; motion-triggered depth recorder</h2>
+    <div class="body">
+      <div class="row">
+        <button id="sentrybtn" class="rec" onclick="toggleSentry()">🛡 Arm sentry</button>
+        <span id="sentrystat" class="hint" style="margin:0"></span>
+      </div>
+      <div id="events" style="margin-top:12px;max-height:150px;overflow:auto;font:12px/1.6 ui-monospace,Menlo,Consolas,monospace"></div>
+      <div class="hint">When armed, the studio auto-records a depth clip whenever it detects motion and stops when the scene clears — a privacy-friendly camera that captures <em>depth</em>, not video. Clips appear in the replay list above.</div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -793,6 +861,7 @@ async function poll(){
     if(scanning&&st.scan_frames) document.getElementById('scaninfo').textContent='fusing… '+st.scan_frames+' frames';
     if(st.vision_on) document.getElementById('visinfo').textContent=(st.objects||0)+' object'+(st.objects===1?'':'s')+' detected';
     else document.getElementById('visinfo').textContent='';
+    if(st.sentry_on!==undefined) document.getElementById('sentrystat').textContent=st.sentry_on?(st.sentry_rec?'● RECORDING (motion)':'armed — watching'):'';
     // activity sparkline (foreground area over time)
     spark.push(Math.min(1,(g.area||0)/120)); if(spark.length>300)spark.shift();
     drawSpark();
@@ -950,6 +1019,23 @@ function toggleShowScan(){showScan=!showScan;
 async function toggleVision(){const j=await act('vision_toggle');
   document.getElementById('visbtn').textContent='🔍 Vision (object detection): '+(j.on?'on':'off');}
 
+// ---------- Sentry ----------
+let sentryOn=false;
+async function toggleSentry(){const j=await act('sentry_toggle');sentryOn=j.on;
+  const b=document.getElementById('sentrybtn');b.classList.toggle('active',sentryOn);
+  b.textContent=sentryOn?'■ Disarm sentry':'🛡 Arm sentry';}
+async function pullEvents(){
+  try{const r=await fetch('/events.json');const evs=await r.json();
+    const el=document.getElementById('events');
+    el.innerHTML=evs.slice().reverse().map(e=>{
+      const t=new Date(e.t*1000).toLocaleTimeString();
+      const c=e.label.indexOf('motion')>=0?'#ff6b3d':(e.label.indexOf('clear')>=0?'#42e07a':'#6b7a8d');
+      return `<div style="color:${c}">${t} &nbsp; ${e.label}${e.dist?' ('+e.dist+'mm)':''}</div>`;
+    }).join('')||'<div style="color:#6b7a8d">no events yet</div>';
+  }catch(e){}
+  setTimeout(pullEvents, 700);
+}
+
 // ---------- Record the 3D view to a WebM clip (shareable) ----------
 let mediaRec=null,chunks=[];
 function toggleClip(){
@@ -1036,7 +1122,7 @@ async function togglePaint(){const j=await act('paint_toggle');
   const b=document.getElementById('paintbtn');const on=j.on;
   b.classList.toggle('active',on);b.textContent='✏ Air-draw: '+(on?'on':'off');}
 
-poll(); pullCloud(); pullPaint(); render();
+poll(); pullCloud(); pullPaint(); pullEvents(); render();
 </script>
 </body></html>
 """

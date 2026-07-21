@@ -27,6 +27,7 @@ otherwise-idle CPU cores, RAM, and disk to work.
 | **Long-exposure 3D scan** | Fuse many seconds of frames into one **dense, denoised, gap-filled** cloud (a zone that's valid in *any* frame gets filled) — turns the live sensor into a capture tool. View the frozen result and export it. |
 | **Hands-free control** | Control the studio by gesture — **swipe** switches the 3D view, **wave** resets the background — no keyboard or mouse. |
 | **Record clip** | Capture the spinning 3D view to a downloadable **WebM video** (via the browser's MediaRecorder) — a shareable clip of your cloud. |
+| **Sentry mode** | Arm it and the studio becomes a **privacy-friendly smart camera**: it auto-records a depth clip whenever motion is detected and stops when the scene clears, with a timestamped **event log**. Captures *depth*, not video. |
 | **Record & replay** | One-click recording of the depth stream to disk (`.ldr` files), replayed right in the same UI. |
 | **PLY export** | Export the current frame as a standard **`.ply` point cloud** — plus an **HD snapshot** that temporally averages recent frames to denoise it. Opens in MeshLab, CloudCompare, Blender, or any online point-cloud viewer, and is easy to share. |
 
