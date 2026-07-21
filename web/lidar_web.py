@@ -98,6 +98,13 @@ class Studio:
         self.play_idx = 0
         self.playing = False
 
+        # HD snapshot: a short ring of recent frames to temporally average.
+        self.recent = collections.deque(maxlen=32)
+        # Air-drawing: accumulate fingertip positions into a 3D sketch.
+        self.paint_on = False
+        self.paint = []             # list of (x,y,z, r,g,b) floats
+        self._paint_last = None
+
     # -- called by the sensor thread each frame --
     def push_live(self, depth):
         g = self.gest.update(depth)
@@ -105,9 +112,34 @@ class Studio:
             if not self.playing:
                 self.depth = depth
                 self.gesture = g
+                self.recent.append(depth)
             if self.rec_file is not None:
                 self.rec_file.write(depth.tobytes())
                 self.rec_count += 1
+        if self.paint_on and g.get("presence"):
+            self._add_paint(g)
+
+    def _add_paint(self, g):
+        """Drop a colored point at the current fingertip, spaced out."""
+        # Fingertip world position, matching the browser cloud's mapping.
+        x = g["hand_x"] * (RAW_W / 2.0)
+        y = g["hand_y"] * (RAW_H / 2.0)
+        z = -(g["hand_z_mm"] / 22.0 - 40.0)
+        p = (x, y, z)
+        if self._paint_last is not None:
+            d = sum((a - b) ** 2 for a, b in zip(p, self._paint_last))
+            if d < 0.6:          # min spacing so it doesn't clump when still
+                return
+        self._paint_last = p
+        # Color by depth (TURBO-ish), same feel as the cloud.
+        t = 1.0 - min(g["hand_z_mm"], MAX_MM) / MAX_MM
+        r = max(0.0, 1.0 - 1.8 * abs(t - 0.75))
+        gg = max(0.0, 1.0 - 2.2 * abs(t - 0.5))
+        b = max(0.0, 1.0 - 2.0 * abs(t - 0.25))
+        with self.lock:
+            self.paint.append((x, y, z, r, gg, b))
+            if len(self.paint) > 20000:
+                self.paint = self.paint[-20000:]
 
     def push_playback(self):
         with self.lock:
@@ -121,6 +153,39 @@ class Studio:
     def snapshot(self):
         with self.lock:
             return self.depth.copy(), dict(self.gesture), dict(self.stats)
+
+    def hd_depth(self):
+        """Temporally-averaged depth over the recent ring -> denoised frame."""
+        with self.lock:
+            frames = list(self.recent)
+        if not frames:
+            return self.depth.copy()
+        stack = np.stack(frames).astype(np.float32)   # (n,H,W)
+        valid = (stack > 0) & (stack < MAX_MM)
+        cnt = valid.sum(axis=0)
+        summ = np.where(valid, stack, 0.0).sum(axis=0)
+        avg = np.zeros_like(summ)
+        nz = cnt > 0
+        avg[nz] = summ[nz] / cnt[nz]
+        return avg.astype(np.uint16)
+
+    def paint_bytes(self):
+        with self.lock:
+            if not self.paint:
+                return b""
+            return np.asarray(self.paint, dtype="<f4").tobytes()
+
+    def paint_toggle(self, on=None):
+        with self.lock:
+            self.paint_on = (not self.paint_on) if on is None else bool(on)
+            if self.paint_on:
+                self._paint_last = None
+            return self.paint_on
+
+    def paint_clear(self):
+        with self.lock:
+            self.paint = []
+            self._paint_last = None
 
     # -- recording control --
     def rec_start(self):
@@ -329,6 +394,23 @@ def make_ply(depth):
     return "".join(lines).encode()
 
 
+def paint_ply(points):
+    """ASCII PLY of the air-drawn sketch (list of x,y,z,r,g,b floats 0..1)."""
+    n = len(points) if points else 1
+    hdr = ("ply\nformat ascii 1.0\n"
+           f"comment VL53L9CX air-drawing {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+           f"element vertex {n}\n"
+           "property float x\nproperty float y\nproperty float z\n"
+           "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+           "end_header\n")
+    lines = [hdr]
+    if not points:
+        lines.append("0 0 0 0 0 0\n")
+    for (x, y, z, r, g, b) in points:
+        lines.append(f"{x:.2f} {y:.2f} {z:.2f} {int(r*255)} {int(g*255)} {int(b*255)}\n")
+    return "".join(lines).encode()
+
+
 # ---- the dashboard page ---------------------------------------------------
 def page_html():
     html = _PAGE
@@ -364,6 +446,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(200, "text/html; charset=utf-8", page_html())
             elif path == "/stats.json":
                 depth, gesture, stats = STUDIO.snapshot()
+                with STUDIO.lock:
+                    stats["paint_on"] = STUDIO.paint_on
+                    stats["paint_n"] = len(STUDIO.paint)
                 self._send(200, "application/json",
                            json.dumps({"stats": stats, "gesture": gesture,
                                        "recordings": STUDIO.list_recordings()}).encode())
@@ -374,6 +459,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 depth, _, _ = STUDIO.snapshot()
                 fn = time.strftime("lidar_%Y%m%d_%H%M%S.ply")
                 self._send(200, "application/octet-stream", make_ply(depth),
+                           {"Content-Disposition": f'attachment; filename="{fn}"'})
+            elif path == "/snapshot_hd.ply":
+                fn = time.strftime("lidar_hd_%Y%m%d_%H%M%S.ply")
+                self._send(200, "application/octet-stream", make_ply(STUDIO.hd_depth()),
+                           {"Content-Disposition": f'attachment; filename="{fn}"'})
+            elif path == "/paint.bin":
+                self._send(200, "application/octet-stream", STUDIO.paint_bytes())
+            elif path == "/paint.ply":
+                fn = time.strftime("airdraw_%Y%m%d_%H%M%S.ply")
+                with STUDIO.lock:
+                    pts = list(STUDIO.paint)
+                self._send(200, "application/octet-stream", paint_ply(pts),
                            {"Content-Disposition": f'attachment; filename="{fn}"'})
             elif path == "/stream.mjpg":
                 self._mjpeg()
@@ -399,6 +496,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif cmd == "bg_reset":
             depth, _, _ = STUDIO.snapshot()
             STUDIO.gest.reset_background(depth)
+        elif cmd == "paint_toggle":
+            msg["on"] = STUDIO.paint_toggle()
+        elif cmd == "paint_clear":
+            STUDIO.paint_clear()
         else:
             msg = {"ok": False, "error": "unknown cmd"}
         self._send(200, "application/json", json.dumps(msg).encode())
@@ -483,11 +584,15 @@ _PAGE = r"""<!doctype html>
     <canvas id="cloud"></canvas>
     <div class="body">
       <div class="row">
-        <a class="btn" href="/snapshot.ply" download><button>⬇ Export .PLY snapshot</button></a>
+        <button id="viewbtn" onclick="toggleView()">◎ View: Points</button>
         <button id="spin">◔ Auto-spin: on</button>
         <button onclick="act('bg_reset')">⟳ Reset background</button>
       </div>
-      <div class="hint">The .PLY opens in MeshLab, CloudCompare, Blender, or online point-cloud viewers.</div>
+      <div class="row">
+        <a class="btn" href="/snapshot.ply" download><button>⬇ Snapshot .PLY</button></a>
+        <a class="btn" href="/snapshot_hd.ply" download><button>⬇ HD Snapshot .PLY</button></a>
+      </div>
+      <div class="hint">Drag to orbit · scroll to zoom · Mesh view triangulates the depth grid into a lit surface. HD snapshot averages recent frames to denoise. .PLY opens in MeshLab / CloudCompare / Blender.</div>
     </div>
   </div>
 
@@ -540,6 +645,23 @@ _PAGE = r"""<!doctype html>
       <div class="hint">Recordings are stored on the Pi as .ldr files and replay right here in the browser.</div>
     </div>
   </div>
+
+  <div class="card">
+    <h2>Play &amp; create</h2>
+    <div class="body">
+      <div class="row">
+        <button id="thbtn" onclick="toggleTheremin()">🔊 Theremin: off</button>
+        <span class="hint" style="margin:0">Wave your hand: height = pitch, distance = volume, sideways = tone. Plays in <em>your</em> browser.</span>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button id="paintbtn" class="rec" onclick="togglePaint()">✏ Air-draw: off</button>
+        <button onclick="act('paint_clear')">🗑 Clear</button>
+        <a class="btn" href="/paint.ply" download><button>⬇ Export drawing .PLY</button></a>
+        <span id="paintinfo" class="hint" style="margin:0"></span>
+      </div>
+      <div class="hint">Air-draw traces your fingertip through 3D space into the point cloud — paint a sculpture in the air, then export it.</div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -573,6 +695,9 @@ async function poll(){
     if(cur) sel.value=cur;
     if(st.rec) document.getElementById('recinfo').textContent='● '+st.rec+'  '+(st.rec_n||0)+' frames';
     else if(!recording) document.getElementById('recinfo').textContent='';
+    // theremin + air-draw
+    updateTheremin(g);
+    if(st.paint_n!==undefined) document.getElementById('paintinfo').textContent=(st.paint_n>1?st.paint_n+' points':'');
   }catch(e){}
   setTimeout(poll, 100);
 }
@@ -597,10 +722,11 @@ async function toggleRec(){
 function playSel(){const s=document.getElementById('reclist').value; if(s) act('play','&name='+encodeURIComponent(s));}
 document.getElementById('spin').onclick=function(){autospin=!autospin;this.textContent='◔ Auto-spin: '+(autospin?'on':'off');};
 
-// ---------- WebGL 3D point cloud ----------
+// ---------- WebGL 3D view (points / mesh) + air-draw overlay ----------
 const canvas=document.getElementById('cloud');
 const gl=canvas.getContext('webgl',{antialias:true,alpha:false});
-let az=0.6, el=-0.35, zoom=1.0, dragging=false, lx=0, ly=0;
+gl.enable(gl.DEPTH_TEST);
+let az=0.6, el=-0.35, zoom=1.0, dragging=false, lx=0, ly=0, viewMode=0;
 function resize(){const r=canvas.getBoundingClientRect();canvas.width=r.width*devicePixelRatio;canvas.height=420*devicePixelRatio;}
 resize(); addEventListener('resize',resize);
 canvas.addEventListener('pointerdown',e=>{dragging=true;lx=e.clientX;ly=e.clientY;canvas.setPointerCapture(e.pointerId);});
@@ -608,70 +734,129 @@ canvas.addEventListener('pointerup',e=>{dragging=false;});
 canvas.addEventListener('pointermove',e=>{if(!dragging)return;az+=(e.clientX-lx)*0.008;el+=(e.clientY-ly)*0.008;el=Math.max(-1.5,Math.min(1.5,el));lx=e.clientX;ly=e.clientY;});
 canvas.addEventListener('wheel',e=>{e.preventDefault();zoom*=e.deltaY>0?0.92:1.08;zoom=Math.max(0.3,Math.min(4,zoom));},{passive:false});
 
-const VS=`attribute vec3 a_pos; attribute float a_d;
-uniform float u_az,u_el,u_zoom,u_aspect; varying float v_d;
-void main(){
-  float ca=cos(u_az),sa=sin(u_az),ce=cos(u_el),se=sin(u_el);
-  vec3 p=a_pos;
-  vec3 r=vec3(p.x*ca+p.z*sa, p.y, -p.x*sa+p.z*ca);
-  r=vec3(r.x, r.y*ce - r.z*se, r.y*se + r.z*ce);
-  float s=0.026*u_zoom;
-  gl_Position=vec4(r.x*s/u_aspect, r.y*s, r.z*0.004, 1.0);
-  gl_PointSize=max(1.5, 3.5*u_zoom);
-  v_d=a_d;
-}`;
-const FS=`precision mediump float; varying float v_d;
-vec3 turbo(float t){ // compact turbo-ish ramp
-  return clamp(vec3(1.0-1.8*abs(t-0.75), 1.0-2.2*abs(t-0.5), 1.0-2.0*abs(t-0.25)),0.0,1.0);
-}
-void main(){
-  vec2 c=gl_PointCoord-vec2(0.5); if(dot(c,c)>0.25) discard;
-  gl_FragColor=vec4(turbo(v_d),1.0);
-}`;
+const ROT=`vec3 rot(vec3 p){float ca=cos(u_az),sa=sin(u_az),ce=cos(u_el),se=sin(u_el);
+  vec3 r=vec3(p.x*ca+p.z*sa,p.y,-p.x*sa+p.z*ca);
+  return vec3(r.x, r.y*ce-r.z*se, r.y*se+r.z*ce);}`;
+const TURBO=`vec3 turbo(float t){return clamp(vec3(1.0-1.8*abs(t-0.75),1.0-2.2*abs(t-0.5),1.0-2.0*abs(t-0.25)),0.0,1.0);}`;
 function sh(t,s){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);
   if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))console.log(gl.getShaderInfoLog(o));return o;}
-const prog=gl.createProgram();gl.attachShader(prog,sh(gl.VERTEX_SHADER,VS));gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FS));gl.linkProgram(prog);gl.useProgram(prog);
-const buf=gl.createBuffer();
-const a_pos=gl.getAttribLocation(prog,'a_pos'), a_d=gl.getAttribLocation(prog,'a_d');
-gl.enableVertexAttribArray(a_pos);gl.enableVertexAttribArray(a_d);
-const U={az:gl.getUniformLocation(prog,'u_az'),el:gl.getUniformLocation(prog,'u_el'),
-  zoom:gl.getUniformLocation(prog,'u_zoom'),aspect:gl.getUniformLocation(prog,'u_aspect')};
-let nPoints=0;
+function mkProg(vs,fs){const p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,vs));gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(p);
+  p._u={az:gl.getUniformLocation(p,'u_az'),el:gl.getUniformLocation(p,'u_el'),zoom:gl.getUniformLocation(p,'u_zoom'),aspect:gl.getUniformLocation(p,'u_aspect')};return p;}
+function setCam(p){gl.useProgram(p);gl.uniform1f(p._u.az,az);gl.uniform1f(p._u.el,el);gl.uniform1f(p._u.zoom,zoom);gl.uniform1f(p._u.aspect,canvas.width/canvas.height);}
 
+// -- points program --
+const pProg=mkProg(
+ `attribute vec3 a_pos; attribute float a_d; uniform float u_az,u_el,u_zoom,u_aspect; varying float v_d; ${ROT}
+  void main(){vec3 r=rot(a_pos);float s=0.026*u_zoom;gl_Position=vec4(r.x*s/u_aspect,r.y*s,r.z*0.004,1.0);gl_PointSize=max(1.5,3.5*u_zoom);v_d=a_d;}`,
+ `precision mediump float; varying float v_d; ${TURBO}
+  void main(){vec2 c=gl_PointCoord-vec2(0.5);if(dot(c,c)>0.25)discard;gl_FragColor=vec4(turbo(v_d),1.0);}`);
+const pPos=gl.getAttribLocation(pProg,'a_pos'), pD=gl.getAttribLocation(pProg,'a_d');
+// -- mesh program (lit surface) --
+const mProg=mkProg(
+ `attribute vec3 a_pos; attribute vec3 a_nrm; attribute float a_d; uniform float u_az,u_el,u_zoom,u_aspect; varying float v_d; varying vec3 v_n; ${ROT}
+  void main(){vec3 r=rot(a_pos);float s=0.026*u_zoom;gl_Position=vec4(r.x*s/u_aspect,r.y*s,r.z*0.004,1.0);v_n=rot(a_nrm);v_d=a_d;}`,
+ `precision mediump float; varying float v_d; varying vec3 v_n; ${TURBO}
+  void main(){vec3 N=normalize(v_n);float df=abs(dot(N,normalize(vec3(0.4,0.7,0.6))));gl_FragColor=vec4(turbo(v_d)*(0.32+0.68*df),1.0);}`);
+const mPos=gl.getAttribLocation(mProg,'a_pos'), mNrm=gl.getAttribLocation(mProg,'a_nrm'), mD=gl.getAttribLocation(mProg,'a_d');
+// -- paint program (explicit color, glowing dots) --
+const paintProg=mkProg(
+ `attribute vec3 a_pos; attribute vec3 a_col; uniform float u_az,u_el,u_zoom,u_aspect; varying vec3 v_c; ${ROT}
+  void main(){vec3 r=rot(a_pos);float s=0.026*u_zoom;gl_Position=vec4(r.x*s/u_aspect,r.y*s,r.z*0.004-0.001,1.0);gl_PointSize=max(3.0,7.0*u_zoom);v_c=a_col;}`,
+ `precision mediump float; varying vec3 v_c; void main(){vec2 c=gl_PointCoord-vec2(0.5);float d=dot(c,c);if(d>0.25)discard;gl_FragColor=vec4(v_c*(1.3-d*2.0),1.0);}`);
+const qPos=gl.getAttribLocation(paintProg,'a_pos'), qCol=gl.getAttribLocation(paintProg,'a_col');
+
+const pBuf=gl.createBuffer(), mBuf=gl.createBuffer(), qBuf=gl.createBuffer();
+let nPoints=0, nMeshV=0, nPaint=0;
+const ok=z=>z>0&&z<MAX_MM;
+const wp=(c,r,z)=>[c-RAW_W/2, -(r-RAW_H/2), -(z/22.0-40.0)];
+
+function buildPoints(d){
+  const arr=new Float32Array(RAW_W*RAW_H*4);let n=0;
+  for(let r=0;r<RAW_H;r++)for(let c=0;c<RAW_W;c++){const z=d[r*RAW_W+c];if(!ok(z))continue;
+    const p=wp(c,r,z);arr[n*4]=p[0];arr[n*4+1]=p[1];arr[n*4+2]=p[2];arr[n*4+3]=1-z/MAX_MM;n++;}
+  nPoints=n;gl.bindBuffer(gl.ARRAY_BUFFER,pBuf);gl.bufferData(gl.ARRAY_BUFFER,arr.subarray(0,n*4),gl.DYNAMIC_DRAW);
+}
+function nrm(A,B,C){const u=[B[0]-A[0],B[1]-A[1],B[2]-A[2]],w=[C[0]-A[0],C[1]-A[1],C[2]-A[2]];
+  let x=u[1]*w[2]-u[2]*w[1],y=u[2]*w[0]-u[0]*w[2],z=u[0]*w[1]-u[1]*w[0];const L=Math.hypot(x,y,z)||1;return [x/L,y/L,z/L];}
+function buildMesh(d){
+  const v=[];
+  const pushT=(A,B,C,za,zb,zc)=>{const n=nrm(A,B,C);
+    v.push(A[0],A[1],A[2],n[0],n[1],n[2],1-za/MAX_MM, B[0],B[1],B[2],n[0],n[1],n[2],1-zb/MAX_MM, C[0],C[1],C[2],n[0],n[1],n[2],1-zc/MAX_MM);};
+  for(let r=0;r<RAW_H-1;r++)for(let c=0;c<RAW_W-1;c++){
+    const z00=d[r*RAW_W+c],z10=d[r*RAW_W+c+1],z01=d[(r+1)*RAW_W+c],z11=d[(r+1)*RAW_W+c+1];
+    if(!ok(z00)||!ok(z10)||!ok(z01)||!ok(z11))continue;
+    if(Math.max(z00,z10,z01,z11)-Math.min(z00,z10,z01,z11)>400)continue;  // no rubber sheets over edges
+    const p00=wp(c,r,z00),p10=wp(c+1,r,z10),p01=wp(c,r+1,z01),p11=wp(c+1,r+1,z11);
+    pushT(p00,p10,p11,z00,z10,z11);pushT(p00,p11,p01,z00,z11,z01);
+  }
+  nMeshV=v.length/7;gl.bindBuffer(gl.ARRAY_BUFFER,mBuf);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(v),gl.DYNAMIC_DRAW);
+}
 async function pullCloud(){
-  try{
-    const r=await fetch('/depth.bin'); const ab=await r.arrayBuffer();
-    const d=new Uint16Array(ab);
-    const arr=new Float32Array(RAW_W*RAW_H*4); let n=0;
-    for(let row=0;row<RAW_H;row++)for(let col=0;col<RAW_W;col++){
-      const z=d[row*RAW_W+col]; if(z===0||z>=MAX_MM)continue;
-      const dn=1.0 - Math.min(z,MAX_MM)/MAX_MM;
-      arr[n*4  ]=(col-RAW_W/2);
-      arr[n*4+1]=-(row-RAW_H/2);
-      arr[n*4+2]=-(z/22.0 - 40.0);
-      arr[n*4+3]=dn; n++;
-    }
-    nPoints=n;
-    gl.bindBuffer(gl.ARRAY_BUFFER,buf);
-    gl.bufferData(gl.ARRAY_BUFFER,arr.subarray(0,n*4),gl.DYNAMIC_DRAW);
-  }catch(e){}
-  setTimeout(pullCloud, 55);   // ~18 Hz cloud refresh
+  try{const r=await fetch('/depth.bin');const d=new Uint16Array(await r.arrayBuffer());
+    if(viewMode===0)buildPoints(d);else buildMesh(d);}catch(e){}
+  setTimeout(pullCloud,55);
+}
+async function pullPaint(){
+  try{const r=await fetch('/paint.bin');const ab=await r.arrayBuffer();
+    if(ab.byteLength>0){gl.bindBuffer(gl.ARRAY_BUFFER,qBuf);gl.bufferData(gl.ARRAY_BUFFER,ab,gl.DYNAMIC_DRAW);nPaint=ab.byteLength/24;}
+    else nPaint=0;}catch(e){}
+  setTimeout(pullPaint,150);
 }
 function render(){
-  if(autospin && !dragging) az+=0.004;
+  if(autospin&&!dragging)az+=0.004;
   gl.viewport(0,0,canvas.width,canvas.height);
-  gl.clearColor(0.02,0.03,0.05,1); gl.clear(gl.COLOR_BUFFER_BIT);
-  if(nPoints>0){
-    gl.bindBuffer(gl.ARRAY_BUFFER,buf);
-    gl.vertexAttribPointer(a_pos,3,gl.FLOAT,false,16,0);
-    gl.vertexAttribPointer(a_d,1,gl.FLOAT,false,16,12);
-    gl.uniform1f(U.az,az);gl.uniform1f(U.el,el);gl.uniform1f(U.zoom,zoom);
-    gl.uniform1f(U.aspect,canvas.width/canvas.height);
-    gl.drawArrays(gl.POINTS,0,nPoints);
-  }
+  gl.clearColor(0.02,0.03,0.05,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  if(viewMode===0&&nPoints>0){setCam(pProg);gl.bindBuffer(gl.ARRAY_BUFFER,pBuf);
+    gl.enableVertexAttribArray(pPos);gl.vertexAttribPointer(pPos,3,gl.FLOAT,false,16,0);
+    gl.enableVertexAttribArray(pD);gl.vertexAttribPointer(pD,1,gl.FLOAT,false,16,12);
+    gl.drawArrays(gl.POINTS,0,nPoints);}
+  else if(viewMode===1&&nMeshV>0){setCam(mProg);gl.bindBuffer(gl.ARRAY_BUFFER,mBuf);
+    gl.enableVertexAttribArray(mPos);gl.vertexAttribPointer(mPos,3,gl.FLOAT,false,28,0);
+    gl.enableVertexAttribArray(mNrm);gl.vertexAttribPointer(mNrm,3,gl.FLOAT,false,28,12);
+    gl.enableVertexAttribArray(mD);gl.vertexAttribPointer(mD,1,gl.FLOAT,false,28,24);
+    gl.drawArrays(gl.TRIANGLES,0,nMeshV);}
+  if(nPaint>0){setCam(paintProg);gl.bindBuffer(gl.ARRAY_BUFFER,qBuf);
+    gl.enableVertexAttribArray(qPos);gl.vertexAttribPointer(qPos,3,gl.FLOAT,false,24,0);
+    gl.enableVertexAttribArray(qCol);gl.vertexAttribPointer(qCol,3,gl.FLOAT,false,24,12);
+    gl.drawArrays(gl.POINTS,0,nPaint);}
   requestAnimationFrame(render);
 }
-poll(); pullCloud(); render();
+function toggleView(){viewMode=1-viewMode;document.getElementById('viewbtn').textContent=viewMode?'▦ View: Mesh':'◎ View: Points';}
+
+// ---------- Theremin (Web Audio, runs in YOUR browser) ----------
+let actx=null,osc=null,osc2=null,gain=null,filt=null,thOn=false;
+const SCALE=[0,2,4,7,9,12,14,16,19,21,24];   // 2-octave pentatonic -> always musical
+function toggleTheremin(){
+  thOn=!thOn;document.getElementById('thbtn').textContent='🔊 Theremin: '+(thOn?'on':'off');
+  if(thOn){
+    if(!actx){actx=new (window.AudioContext||window.webkitAudioContext)();
+      osc=actx.createOscillator();osc.type='sawtooth';
+      osc2=actx.createOscillator();osc2.type='triangle';osc2.detune.value=6;
+      filt=actx.createBiquadFilter();filt.type='lowpass';filt.frequency.value=900;
+      gain=actx.createGain();gain.gain.value=0;
+      osc.connect(filt);osc2.connect(filt);filt.connect(gain);gain.connect(actx.destination);
+      osc.start();osc2.start();}
+    actx.resume();
+  }else if(gain){gain.gain.setTargetAtTime(0,actx.currentTime,0.05);}
+}
+function updateTheremin(g){
+  if(!thOn||!actx)return;const t=actx.currentTime;
+  if(g&&g.presence){
+    const idx=Math.max(0,Math.min(SCALE.length-1,Math.round((g.hand_y*0.5+0.5)*(SCALE.length-1))));
+    const midi=45+SCALE[idx];const f=440*Math.pow(2,(midi-69)/12);
+    osc.frequency.setTargetAtTime(f,t,0.05);osc2.frequency.setTargetAtTime(f,t,0.05);
+    filt.frequency.setTargetAtTime(350+(g.hand_x*0.5+0.5)*3200,t,0.05);
+    const vol=Math.max(0,Math.min(0.22,(1-Math.min(g.hand_z_mm,3000)/3000)*0.28));
+    gain.gain.setTargetAtTime(vol,t,0.04);
+  }else{gain.gain.setTargetAtTime(0,t,0.1);}
+}
+
+// ---------- Air-draw ----------
+async function togglePaint(){const j=await act('paint_toggle');
+  const b=document.getElementById('paintbtn');const on=j.on;
+  b.classList.toggle('active',on);b.textContent='✏ Air-draw: '+(on?'on':'off');}
+
+poll(); pullCloud(); pullPaint(); render();
 </script>
 </body></html>
 """

@@ -18,11 +18,13 @@ otherwise-idle CPU cores, RAM, and disk to work.
 
 | Panel | What you get |
 |---|---|
-| **3D point cloud** | The depth field rendered as an orbitable, auto-spinning point cloud in raw **WebGL** — drag to orbit, scroll to zoom, colored by distance. Runs entirely in the browser; the Pi just streams raw depth. |
+| **3D view** | The depth field rendered in raw **WebGL** — drag to orbit, scroll to zoom, auto-spin. Toggle between a **point cloud** and a **lit triangulated surface mesh** (the depth grid stitched into a shaded 3D surface, with silhouette edges left open so it doesn't rubber-sheet). Runs entirely in the browser; the Pi just streams raw depth. |
 | **Depth heatmap** | A live MJPEG stream of the colormapped depth grid with the tracked hand overlaid, plus closest-object / mean-depth / active-zone stats. |
 | **Gesture recognition** | Real-time hand tracking with **wave / push / pull / swipe-left / swipe-right** detection and a hand-position trail map. |
+| **LiDAR Theremin** | Play the sensor like an instrument — hand **height sets pitch** (quantized to a pentatonic scale so it's always musical), **distance sets volume**, **sideways sets tone/filter**. The Pi tracks your hand; the audio is synthesized in **your browser** via Web Audio, so no speakers on the Pi are needed. |
+| **Air-drawing** | Trace your fingertip through 3D space to paint a persistent point trail into the cloud — sculpt in the air, then export the drawing as its own `.ply`. |
 | **Record & replay** | One-click recording of the depth stream to disk (`.ldr` files), replayed right in the same UI. |
-| **PLY export** | Export the current frame as a standard **`.ply` point cloud** — opens in MeshLab, CloudCompare, Blender, or any online point-cloud viewer, and is easy to share. |
+| **PLY export** | Export the current frame as a standard **`.ply` point cloud** — plus an **HD snapshot** that temporally averages recent frames to denoise it. Opens in MeshLab, CloudCompare, Blender, or any online point-cloud viewer, and is easy to share. |
 
 Everything updates in real time and multiple devices can watch at once.
 
@@ -37,12 +39,14 @@ Everything updates in real time and multiple devices can watch at once.
   decodes each RAW8 frame into a depth grid, runs gesture recognition, and
   publishes the latest frame + stats into a lock-guarded shared state.
 - **Threaded HTTP** serves many clients at once. Endpoints:
-  - `GET /` — the single-page dashboard (HTML + inline WebGL, no external assets)
+  - `GET /` — the single-page dashboard (HTML + inline WebGL + Web Audio, no external assets)
   - `GET /stream.mjpg` — `multipart/x-mixed-replace` depth heatmap (~25 fps)
-  - `GET /depth.bin` — the latest frame as raw `uint16` (feeds the WebGL cloud, ~18 Hz)
-  - `GET /stats.json` — live stats, gesture state, recording list
-  - `GET /snapshot.ply` — the current cloud as an ASCII PLY download
-  - `GET /action?cmd=…` — record start/stop, replay, background reset
+  - `GET /depth.bin` — the latest frame as raw `uint16` (feeds the WebGL cloud/mesh, ~18 Hz)
+  - `GET /paint.bin` — the accumulated air-drawing points (`float32` x,y,z,r,g,b)
+  - `GET /stats.json` — live stats, gesture state, recording list, paint state
+  - `GET /snapshot.ply`, `GET /snapshot_hd.ply` — current / temporally-averaged cloud as PLY
+  - `GET /paint.ply` — the air-drawing as a PLY download
+  - `GET /action?cmd=…` — record start/stop, replay, background reset, air-draw toggle/clear
 - **Gesture engine** (`web/lidar_gestures.py`) is dependency-light and
   **unit-tested with synthetic frames** (`python3 lidar_gestures.py`). It keeps a
   slow background model, segments the **largest connected foreground blob** (so
