@@ -605,6 +605,10 @@ _PAGE = r"""<!doctype html>
         <div class="stat"><div class="k">Mean depth</div><div class="v" id="s_mean">--<small> mm</small></div></div>
         <div class="stat"><div class="k">Active zones</div><div class="v" id="s_act">--</div></div>
       </div>
+      <div style="margin-top:12px">
+        <div class="k" style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.8px">Activity (last ~30 s)</div>
+        <canvas id="spark" width="600" height="60" style="width:100%;height:44px;background:#0d131c;border:1px solid var(--ln);border-radius:7px;margin-top:6px"></canvas>
+      </div>
     </div>
   </div>
 
@@ -698,8 +702,21 @@ async function poll(){
     // theremin + air-draw
     updateTheremin(g);
     if(st.paint_n!==undefined) document.getElementById('paintinfo').textContent=(st.paint_n>1?st.paint_n+' points':'');
+    // activity sparkline (foreground area over time)
+    spark.push(Math.min(1,(g.area||0)/120)); if(spark.length>300)spark.shift();
+    drawSpark();
   }catch(e){}
   setTimeout(poll, 100);
+}
+const sparkCtx=document.getElementById('spark').getContext('2d');
+let spark=[];
+function drawSpark(){
+  const c=sparkCtx,W=600,H=60;c.clearRect(0,0,W,H);
+  c.strokeStyle='#39d0ff';c.lineWidth=2;c.beginPath();
+  const step=W/300;
+  spark.forEach((v,i)=>{const x=i*step,y=H-4-v*(H-8);i?c.lineTo(x,y):c.moveTo(x,y);});
+  c.stroke();
+  c.fillStyle='rgba(57,208,255,.12)';c.lineTo(spark.length*step,H);c.lineTo(0,H);c.closePath();c.fill();
 }
 function setChip(id,on,txt){const e=document.getElementById(id);e.classList.toggle('on',!!on);if(txt)e.textContent=txt;}
 function drawPos(g){
@@ -849,6 +866,32 @@ function updateTheremin(g){
     const vol=Math.max(0,Math.min(0.22,(1-Math.min(g.hand_z_mm,3000)/3000)*0.28));
     gain.gain.setTargetAtTime(vol,t,0.04);
   }else{gain.gain.setTargetAtTime(0,t,0.1);}
+  // Gesture percussion, edge-triggered: swipe = drum hit, push = bass pluck.
+  if(g){
+    if(g.swipe && g.swipe!==lastSwipe) hit(g.swipe==='left'?1400:2200);
+    lastSwipe=g.swipe||'';
+    const nowPush=(g.pushpull==='push');
+    if(nowPush && !lastPush) bass(g);
+    lastPush=nowPush;
+  }
+}
+let lastSwipe='', lastPush=false;
+function hit(freq){                     // short filtered noise burst -> drum/snare
+  if(!actx)return;const t=actx.currentTime;
+  const n=actx.sampleRate*0.15|0;const b=actx.createBuffer(1,n,actx.sampleRate);const ch=b.getChannelData(0);
+  for(let i=0;i<n;i++)ch[i]=(Math.random()*2-1)*Math.pow(1-i/n,3);
+  const src=actx.createBufferSource();src.buffer=b;
+  const bp=actx.createBiquadFilter();bp.type='bandpass';bp.frequency.value=freq;bp.Q.value=1.2;
+  const gg=actx.createGain();gg.gain.value=0.5;
+  src.connect(bp);bp.connect(gg);gg.connect(actx.destination);src.start();
+}
+function bass(g){                        // plucked low sine on push
+  if(!actx)return;const t=actx.currentTime;
+  const idx=Math.max(0,Math.min(SCALE.length-1,Math.round((g.hand_y*0.5+0.5)*(SCALE.length-1))));
+  const f=440*Math.pow(2,(33+SCALE[idx]-69)/12);
+  const o=actx.createOscillator();o.type='sine';o.frequency.value=f;
+  const gg=actx.createGain();gg.gain.setValueAtTime(0.35,t);gg.gain.exponentialRampToValueAtTime(0.001,t+0.35);
+  o.connect(gg);gg.connect(actx.destination);o.start();o.stop(t+0.36);
 }
 
 // ---------- Air-draw ----------
