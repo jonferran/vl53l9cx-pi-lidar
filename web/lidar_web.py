@@ -100,6 +100,14 @@ class Studio:
 
         # HD snapshot: a short ring of recent frames to temporally average.
         self.recent = collections.deque(maxlen=32)
+        # Long-exposure scan: per-zone running sum/count of valid depths so a
+        # multi-second capture fuses into one dense, denoised, gap-filled frame
+        # (a zone invalid in some frames but valid in others still gets filled).
+        self.scanning = False
+        self.scan_sum = np.zeros((RAW_H, RAW_W), dtype=np.float64)
+        self.scan_cnt = np.zeros((RAW_H, RAW_W), dtype=np.int32)
+        self.scan_frames = 0
+        self.scan_fused = None      # uint16 (H,W) once a scan is finished
         # Air-drawing: accumulate fingertip positions into a 3D sketch.
         self.paint_on = False
         self.paint = []             # list of (x,y,z, r,g,b) floats
@@ -116,8 +124,40 @@ class Studio:
             if self.rec_file is not None:
                 self.rec_file.write(depth.tobytes())
                 self.rec_count += 1
+            if self.scanning:
+                v = (depth > 0) & (depth < MAX_MM)
+                self.scan_sum[v] += depth[v]
+                self.scan_cnt[v] += 1
+                self.scan_frames += 1
         if self.paint_on and g.get("presence"):
             self._add_paint(g)
+
+    def scan_start(self):
+        with self.lock:
+            self.scan_sum[:] = 0.0
+            self.scan_cnt[:] = 0
+            self.scan_frames = 0
+            self.scanning = True
+
+    def scan_stop(self):
+        with self.lock:
+            self.scanning = False
+            cnt = self.scan_cnt
+            fused = np.zeros_like(cnt, dtype=np.uint16)
+            nz = cnt > 0
+            fused[nz] = (self.scan_sum[nz] / cnt[nz]).astype(np.uint16)
+            self.scan_fused = fused
+            return int(self.scan_frames), int(nz.sum())
+
+    def scan_bytes(self):
+        with self.lock:
+            if self.scan_fused is None:
+                return b""
+            return self.scan_fused.astype("<u2").tobytes()
+
+    def scan_frame(self):
+        with self.lock:
+            return None if self.scan_fused is None else self.scan_fused.copy()
 
     def _add_paint(self, g):
         """Drop a colored point at the current fingertip, spaced out."""
@@ -449,6 +489,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 with STUDIO.lock:
                     stats["paint_on"] = STUDIO.paint_on
                     stats["paint_n"] = len(STUDIO.paint)
+                    stats["scanning"] = STUDIO.scanning
+                    stats["scan_frames"] = STUDIO.scan_frames
+                    stats["scan_ready"] = STUDIO.scan_fused is not None
                 self._send(200, "application/json",
                            json.dumps({"stats": stats, "gesture": gesture,
                                        "recordings": STUDIO.list_recordings()}).encode())
@@ -466,6 +509,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            {"Content-Disposition": f'attachment; filename="{fn}"'})
             elif path == "/paint.bin":
                 self._send(200, "application/octet-stream", STUDIO.paint_bytes())
+            elif path == "/scan.bin":
+                self._send(200, "application/octet-stream", STUDIO.scan_bytes())
+            elif path == "/scan.ply":
+                fr = STUDIO.scan_frame()
+                fn = time.strftime("scan_%Y%m%d_%H%M%S.ply")
+                body = make_ply(fr) if fr is not None else make_ply(np.zeros((RAW_H, RAW_W), np.uint16))
+                self._send(200, "application/octet-stream", body,
+                           {"Content-Disposition": f'attachment; filename="{fn}"'})
             elif path == "/paint.ply":
                 fn = time.strftime("airdraw_%Y%m%d_%H%M%S.ply")
                 with STUDIO.lock:
@@ -500,6 +551,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             msg["on"] = STUDIO.paint_toggle()
         elif cmd == "paint_clear":
             STUDIO.paint_clear()
+        elif cmd == "scan_start":
+            STUDIO.scan_start()
+        elif cmd == "scan_stop":
+            frames, zones = STUDIO.scan_stop()
+            msg["frames"], msg["zones"] = frames, zones
         else:
             msg = {"ok": False, "error": "unknown cmd"}
         self._send(200, "application/json", json.dumps(msg).encode())
@@ -589,10 +645,18 @@ _PAGE = r"""<!doctype html>
         <button onclick="act('bg_reset')">⟳ Reset background</button>
       </div>
       <div class="row">
-        <a class="btn" href="/snapshot.ply" download><button>⬇ Snapshot .PLY</button></a>
-        <a class="btn" href="/snapshot_hd.ply" download><button>⬇ HD Snapshot .PLY</button></a>
+        <button id="scanbtn" class="rec" onclick="toggleScan()">📸 Long-exposure scan</button>
+        <button id="viewscanbtn" onclick="toggleShowScan()" style="display:none">👁 View scan</button>
+        <a class="btn" id="scandl" href="/scan.ply" download style="display:none"><button>⬇ Scan .PLY</button></a>
+        <span id="scaninfo" class="hint" style="margin:0"></span>
       </div>
-      <div class="hint">Drag to orbit · scroll to zoom · Mesh view triangulates the depth grid into a lit surface. HD snapshot averages recent frames to denoise. .PLY opens in MeshLab / CloudCompare / Blender.</div>
+      <div class="row">
+        <a class="btn" href="/snapshot.ply" download><button>⬇ Snapshot .PLY</button></a>
+        <a class="btn" href="/snapshot_hd.ply" download><button>⬇ HD .PLY</button></a>
+        <button id="clipbtn" onclick="toggleClip()">🎥 Record clip</button>
+        <button id="hfbtn" onclick="toggleHF()">🖐 Hands-free: off</button>
+      </div>
+      <div class="hint">Drag to orbit · scroll to zoom · Mesh view is a lit surface · Long-exposure scan fuses many frames into a dense denoised cloud · Record clip saves a WebM of the spinning view · Hands-free: swipe = switch view, wave = reset. .PLY opens in MeshLab / CloudCompare / Blender.</div>
     </div>
   </div>
 
@@ -699,9 +763,11 @@ async function poll(){
     if(cur) sel.value=cur;
     if(st.rec) document.getElementById('recinfo').textContent='● '+st.rec+'  '+(st.rec_n||0)+' frames';
     else if(!recording) document.getElementById('recinfo').textContent='';
-    // theremin + air-draw
+    // theremin + air-draw + hands-free
     updateTheremin(g);
+    handsFreeControl(g);
     if(st.paint_n!==undefined) document.getElementById('paintinfo').textContent=(st.paint_n>1?st.paint_n+' points':'');
+    if(scanning&&st.scan_frames) document.getElementById('scaninfo').textContent='fusing… '+st.scan_frames+' frames';
     // activity sparkline (foreground area over time)
     spark.push(Math.min(1,(g.area||0)/120)); if(spark.length>300)spark.shift();
     drawSpark();
@@ -808,10 +874,12 @@ function buildMesh(d){
   }
   nMeshV=v.length/7;gl.bindBuffer(gl.ARRAY_BUFFER,mBuf);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(v),gl.DYNAMIC_DRAW);
 }
+let showScan=false;
 async function pullCloud(){
-  try{const r=await fetch('/depth.bin');const d=new Uint16Array(await r.arrayBuffer());
-    if(viewMode===0)buildPoints(d);else buildMesh(d);}catch(e){}
-  setTimeout(pullCloud,55);
+  try{const r=await fetch(showScan?'/scan.bin':'/depth.bin');const ab=await r.arrayBuffer();
+    if(ab.byteLength>=RAW_W*RAW_H*2){const d=new Uint16Array(ab);
+      if(viewMode===0)buildPoints(d);else buildMesh(d);}}catch(e){}
+  setTimeout(pullCloud, showScan?400:55);   // frozen scan needs no fast refresh
 }
 async function pullPaint(){
   try{const r=await fetch('/paint.bin');const ab=await r.arrayBuffer();
@@ -839,6 +907,46 @@ function render(){
   requestAnimationFrame(render);
 }
 function toggleView(){viewMode=1-viewMode;document.getElementById('viewbtn').textContent=viewMode?'▦ View: Mesh':'◎ View: Points';}
+
+// ---------- Long-exposure scan ----------
+let scanning=false;
+async function toggleScan(){
+  const b=document.getElementById('scanbtn');
+  if(!scanning){await act('scan_start');scanning=true;b.classList.add('active');b.textContent='■ Stop scan';
+    document.getElementById('scaninfo').textContent='fusing frames…';}
+  else{const j=await act('scan_stop');scanning=false;b.classList.remove('active');b.textContent='📸 Long-exposure scan';
+    document.getElementById('scaninfo').textContent='scan: '+j.frames+' frames → '+j.zones+' zones';
+    document.getElementById('viewscanbtn').style.display='';document.getElementById('scandl').style.display='';}
+}
+function toggleShowScan(){showScan=!showScan;
+  document.getElementById('viewscanbtn').textContent=showScan?'👁 View live':'👁 View scan';}
+
+// ---------- Record the 3D view to a WebM clip (shareable) ----------
+let mediaRec=null,chunks=[];
+function toggleClip(){
+  const b=document.getElementById('clipbtn');
+  if(!mediaRec){
+    let stream; try{stream=canvas.captureStream(30);}catch(e){alert('Canvas capture not supported here');return;}
+    let mime='video/webm'; if(window.MediaRecorder&&!MediaRecorder.isTypeSupported(mime))mime='';
+    try{mediaRec=new MediaRecorder(stream, mime?{mimeType:mime}:undefined);}catch(e){alert('MediaRecorder not supported');return;}
+    chunks=[];mediaRec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data);};
+    mediaRec.onstop=()=>{const blob=new Blob(chunks,{type:'video/webm'});const url=URL.createObjectURL(blob);
+      const a=document.createElement('a');a.href=url;a.download='lidar_clip_'+Date.now()+'.webm';a.click();
+      setTimeout(()=>URL.revokeObjectURL(url),2000);mediaRec=null;b.textContent='🎥 Record clip';b.classList.remove('active');};
+    mediaRec.start();b.textContent='■ Stop clip';b.classList.add('active');
+  }else mediaRec.stop();
+}
+
+// ---------- Hands-free gesture control ----------
+let handsFree=false,hfLastSwipe='',hfWaveT=0;
+function toggleHF(){handsFree=!handsFree;document.getElementById('hfbtn').textContent='🖐 Hands-free: '+(handsFree?'on':'off');}
+function handsFreeControl(g){
+  if(!handsFree||!g)return;
+  if(g.swipe&&g.swipe!==hfLastSwipe){viewMode=(g.swipe==='right')?1:0;
+    document.getElementById('viewbtn').textContent=viewMode?'▦ View: Mesh':'◎ View: Points';}
+  hfLastSwipe=g.swipe||'';
+  if(g.wave){const now=Date.now();if(now-hfWaveT>1500){hfWaveT=now;act('bg_reset');}}
+}
 
 // ---------- Theremin (Web Audio, runs in YOUR browser) ----------
 let actx=null,osc=null,osc2=null,gain=null,filt=null,thOn=false;

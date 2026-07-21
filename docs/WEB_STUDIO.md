@@ -23,6 +23,9 @@ otherwise-idle CPU cores, RAM, and disk to work.
 | **Gesture recognition** | Real-time hand tracking with **wave / push / pull / swipe-left / swipe-right** detection and a hand-position trail map. |
 | **LiDAR Theremin** | Play the sensor like an instrument — hand **height sets pitch** (quantized to a pentatonic scale so it's always musical), **distance sets volume**, **sideways sets tone/filter**. The Pi tracks your hand; the audio is synthesized in **your browser** via Web Audio, so no speakers on the Pi are needed. |
 | **Air-drawing** | Trace your fingertip through 3D space to paint a persistent point trail into the cloud — sculpt in the air, then export the drawing as its own `.ply`. |
+| **Long-exposure 3D scan** | Fuse many seconds of frames into one **dense, denoised, gap-filled** cloud (a zone that's valid in *any* frame gets filled) — turns the live sensor into a capture tool. View the frozen result and export it. |
+| **Hands-free control** | Control the studio by gesture — **swipe** switches the 3D view, **wave** resets the background — no keyboard or mouse. |
+| **Record clip** | Capture the spinning 3D view to a downloadable **WebM video** (via the browser's MediaRecorder) — a shareable clip of your cloud. |
 | **Record & replay** | One-click recording of the depth stream to disk (`.ldr` files), replayed right in the same UI. |
 | **PLY export** | Export the current frame as a standard **`.ply` point cloud** — plus an **HD snapshot** that temporally averages recent frames to denoise it. Opens in MeshLab, CloudCompare, Blender, or any online point-cloud viewer, and is easy to share. |
 
@@ -44,9 +47,10 @@ Everything updates in real time and multiple devices can watch at once.
   - `GET /depth.bin` — the latest frame as raw `uint16` (feeds the WebGL cloud/mesh, ~18 Hz)
   - `GET /paint.bin` — the accumulated air-drawing points (`float32` x,y,z,r,g,b)
   - `GET /stats.json` — live stats, gesture state, recording list, paint state
-  - `GET /snapshot.ply`, `GET /snapshot_hd.ply` — current / temporally-averaged cloud as PLY
+  - `GET /snapshot.ply`, `GET /snapshot_hd.ply`, `GET /scan.ply` — current / averaged / fused cloud as PLY
+  - `GET /scan.bin` — the fused long-exposure scan as raw `uint16`
   - `GET /paint.ply` — the air-drawing as a PLY download
-  - `GET /action?cmd=…` — record start/stop, replay, background reset, air-draw toggle/clear
+  - `GET /action?cmd=…` — record, replay, background reset, air-draw, scan start/stop
 - **Gesture engine** (`web/lidar_gestures.py`) is dependency-light and
   **unit-tested with synthetic frames** (`python3 lidar_gestures.py`). It keeps a
   slow background model, segments the **largest connected foreground blob** (so
