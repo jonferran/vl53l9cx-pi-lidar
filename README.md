@@ -21,6 +21,11 @@ ST result buffer, and colour-maps the depth array — all at the sensor's full 1
 - Correct decode of the ST result buffer (distance / amplitude / ambient / DSS layout)
 - Live orientation control and per-frame stats overlay
 - Selectable binning-4 (24 × 24) mode
+- **GPU-shader particle viewer** (`run_lidar_gpu.sh`) — the whole simulation runs in
+  GLSL on the Pi's V3D GPU; see [`docs/GPU_VIEWER_CONTROLS.md`](docs/GPU_VIEWER_CONTROLS.md)
+- **LiDAR Web Studio** (`run_lidar_web.sh`) — a networked browser dashboard with a live
+  WebGL 3D point cloud, gesture recognition, recording/replay, and PLY export; see
+  [`docs/WEB_STUDIO.md`](docs/WEB_STUDIO.md)
 
 ---
 

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ToF LiDAR (Web Studio)
+Comment=Networked LiDAR dashboard: 3D cloud, gestures, recording — open in a browser
+Exec=lxterminal -t "VL53L9CX Web Studio" -e bash -c "$HOME/vl53l9cx-pi-lidar/run_lidar_web.sh; echo; echo 'Press Enter to close...'; read"
+Icon=network-server
+Terminal=false
+Categories=Utility;

@@ -18,3 +18,8 @@ Module.symvers
 tof_pipe
 *.raw
 *.log
+
+# web studio runtime
+web/__pycache__/
+web/recordings/
+*.ldr
