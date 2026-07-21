@@ -112,6 +112,8 @@ class Studio:
         self.paint_on = False
         self.paint = []             # list of (x,y,z, r,g,b) floats
         self._paint_last = None
+        # CV object-detection overlay on the heatmap.
+        self.vision_on = False
 
     # -- called by the sensor thread each frame --
     def push_live(self, depth):
@@ -392,15 +394,27 @@ def sensor_thread():
 
 
 # ---- rendering helpers ----------------------------------------------------
-def heatmap_jpeg(depth, gesture, scale=9):
-    """Colormapped, upscaled depth heatmap as JPEG bytes, with a gesture HUD."""
+def heatmap_jpeg(depth, gesture, vision=False, scale=9):
+    """Colormapped, upscaled depth heatmap as JPEG bytes, with a gesture HUD
+    and (optionally) a computer-vision object-detection overlay."""
     norm = np.clip(255.0 * (1.0 - np.clip(depth, 0, MAX_MM) / MAX_MM), 0, 255).astype(np.uint8)
     norm[depth == 0] = 0
     bgr = cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
     bgr[depth == 0] = (16, 16, 16)
     big = cv2.resize(bgr, (RAW_W * scale, RAW_H * scale), interpolation=cv2.INTER_NEAREST)
-    # Draw the tracked hand centroid.
-    if gesture.get("presence"):
+    if vision:
+        objs = gesture.get("objects", [])
+        for i, o in enumerate(objs):
+            x0, y0, x1, y1 = o["x0"] * scale, o["y0"] * scale, o["x1"] * scale, o["y1"] * scale
+            col = (60, 255, 120) if i == 0 else (255, 200, 40)
+            cv2.rectangle(big, (x0, y0), (x1, y1), col, 2)
+            label = f"#{i+1}  {o['dist_mm']}mm"
+            cv2.putText(big, label, (x0 + 2, max(y0 - 5, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1, cv2.LINE_AA)
+        cv2.putText(big, f"OBJECTS: {len(objs)}", (8, RAW_H * scale - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+    elif gesture.get("presence"):
+        # Draw the tracked hand centroid.
         hx = int((gesture["hand_x"] * 0.5 + 0.5) * (RAW_W * scale))
         hy = int((-gesture["hand_y"] * 0.5 + 0.5) * (RAW_H * scale))
         cv2.circle(big, (hx, hy), 14, (255, 255, 255), 2)
@@ -492,6 +506,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     stats["scanning"] = STUDIO.scanning
                     stats["scan_frames"] = STUDIO.scan_frames
                     stats["scan_ready"] = STUDIO.scan_fused is not None
+                    stats["vision_on"] = STUDIO.vision_on
+                    stats["objects"] = len(gesture.get("objects", []))
                 self._send(200, "application/json",
                            json.dumps({"stats": stats, "gesture": gesture,
                                        "recordings": STUDIO.list_recordings()}).encode())
@@ -556,6 +572,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif cmd == "scan_stop":
             frames, zones = STUDIO.scan_stop()
             msg["frames"], msg["zones"] = frames, zones
+        elif cmd == "vision_toggle":
+            STUDIO.vision_on = not STUDIO.vision_on
+            msg["on"] = STUDIO.vision_on
         else:
             msg = {"ok": False, "error": "unknown cmd"}
         self._send(200, "application/json", json.dumps(msg).encode())
@@ -569,7 +588,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             while STUDIO.running:
                 depth, gesture, _ = STUDIO.snapshot()
-                jpg = heatmap_jpeg(depth, gesture)
+                jpg = heatmap_jpeg(depth, gesture, STUDIO.vision_on)
                 self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n"
                                  b"Content-Length: " + str(len(jpg)).encode() + b"\r\n\r\n")
                 self.wfile.write(jpg)
@@ -663,6 +682,10 @@ _PAGE = r"""<!doctype html>
   <div class="card">
     <h2>Depth heatmap &amp; live stats</h2>
     <div class="body">
+      <div class="row" style="margin-bottom:10px">
+        <button id="visbtn" onclick="toggleVision()">🔍 Vision (object detection): off</button>
+        <span id="visinfo" class="hint" style="margin:0"></span>
+      </div>
       <img id="heat" src="/stream.mjpg" alt="depth heatmap">
       <div class="stats" style="margin-top:12px">
         <div class="stat"><div class="k">Closest</div><div class="v" id="s_min">--<small> mm</small></div></div>
@@ -768,6 +791,8 @@ async function poll(){
     handsFreeControl(g);
     if(st.paint_n!==undefined) document.getElementById('paintinfo').textContent=(st.paint_n>1?st.paint_n+' points':'');
     if(scanning&&st.scan_frames) document.getElementById('scaninfo').textContent='fusing… '+st.scan_frames+' frames';
+    if(st.vision_on) document.getElementById('visinfo').textContent=(st.objects||0)+' object'+(st.objects===1?'':'s')+' detected';
+    else document.getElementById('visinfo').textContent='';
     // activity sparkline (foreground area over time)
     spark.push(Math.min(1,(g.area||0)/120)); if(spark.length>300)spark.shift();
     drawSpark();
@@ -920,6 +945,10 @@ async function toggleScan(){
 }
 function toggleShowScan(){showScan=!showScan;
   document.getElementById('viewscanbtn').textContent=showScan?'👁 View live':'👁 View scan';}
+
+// ---------- CV object detection ----------
+async function toggleVision(){const j=await act('vision_toggle');
+  document.getElementById('visbtn').textContent='🔍 Vision (object detection): '+(j.on?'on':'off');}
 
 // ---------- Record the 3D view to a WebM clip (shareable) ----------
 let mediaRec=null,chunks=[];

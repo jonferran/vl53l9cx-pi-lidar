@@ -81,21 +81,34 @@ class GestureEngine:
         # Foreground = closer than background by a margin (a hand approaching).
         diff = self.bg - self.smooth              # positive where something is nearer
         fg = valid & (diff > self.FG_THRESH_MM)
-        # Keep only the LARGEST connected blob -- a real hand is one connected
-        # region, whereas raw sensor noise is scattered specks. This is what
-        # stops random noise from being tracked as a jittery phantom hand.
+        # Connected-component analysis: the LARGEST blob is the tracked "hand"
+        # (rejecting scattered noise), while ALL blobs above MIN_AREA become
+        # the object-detection list for the vision panel.
+        objects = []
         if _HAVE_CV2 and fg.any():
-            nlab, labels, stats, _ = cv2.connectedComponentsWithStats(
+            nlab, labels, st, cent = cv2.connectedComponentsWithStats(
                 fg.astype(np.uint8), connectivity=8)
             if nlab > 1:
-                biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+                order = np.argsort(-st[1:, cv2.CC_STAT_AREA]) + 1
+                for lab in order:
+                    a = int(st[lab, cv2.CC_STAT_AREA])
+                    if a < self.MIN_AREA:
+                        continue
+                    x0 = int(st[lab, cv2.CC_STAT_LEFT]); y0 = int(st[lab, cv2.CC_STAT_TOP])
+                    x1 = x0 + int(st[lab, cv2.CC_STAT_WIDTH]); y1 = y0 + int(st[lab, cv2.CC_STAT_HEIGHT])
+                    m = labels == lab
+                    dist = int(self.smooth[m].mean())
+                    objects.append({"area": a, "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+                                    "cx": float(cent[lab][0]), "cy": float(cent[lab][1]),
+                                    "dist_mm": dist})
+                biggest = int(order[0])
                 fg = labels == biggest
         area = int(fg.sum())
 
         out = {
             "presence": False, "hand_x": 0.0, "hand_y": 0.0, "hand_z_mm": 0.0,
             "openness": 0.0, "area": area, "wave": False, "pushpull": "",
-            "swipe": "", "waving_amp": 0.0,
+            "swipe": "", "waving_amp": 0.0, "objects": objects,
         }
 
         if area >= self.MIN_AREA:
