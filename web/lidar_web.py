@@ -798,8 +798,9 @@ _PAGE = r"""<!doctype html>
     <div class="body">
       <div class="row">
         <button id="thbtn" onclick="toggleTheremin()">🔊 Theremin: off</button>
-        <span class="hint" style="margin:0">Wave your hand: height = pitch, distance = volume, sideways = tone. Plays in <em>your</em> browser.</span>
+        <button id="ambbtn" onclick="toggleAmbient()">🌌 Soundscape: off</button>
       </div>
+      <div class="hint" style="margin-top:6px">Theremin: wave your hand (height = pitch, distance = volume, sideways = tone; swipe = drum, push = bass). Soundscape: an evolving ambient drone that follows the whole room's depth. Both play in <em>your</em> browser.</div>
       <div class="row" style="margin-top:14px">
         <button id="paintbtn" class="rec" onclick="togglePaint()">✏ Air-draw: off</button>
         <button onclick="act('paint_clear')">🗑 Clear</button>
@@ -854,8 +855,9 @@ async function poll(){
     if(cur) sel.value=cur;
     if(st.rec) document.getElementById('recinfo').textContent='● '+st.rec+'  '+(st.rec_n||0)+' frames';
     else if(!recording) document.getElementById('recinfo').textContent='';
-    // theremin + air-draw + hands-free
+    // theremin + soundscape + air-draw + hands-free
     updateTheremin(g);
+    updateAmbient(st);
     handsFreeControl(g);
     if(st.paint_n!==undefined) document.getElementById('paintinfo').textContent=(st.paint_n>1?st.paint_n+' points':'');
     if(scanning&&st.scan_frames) document.getElementById('scaninfo').textContent='fusing… '+st.scan_frames+' frames';
@@ -1115,6 +1117,38 @@ function bass(g){                        // plucked low sine on push
   const o=actx.createOscillator();o.type='sine';o.frequency.value=f;
   const gg=actx.createGain();gg.gain.setValueAtTime(0.35,t);gg.gain.exponentialRampToValueAtTime(0.001,t+0.35);
   o.connect(gg);gg.connect(actx.destination);o.start();o.stop(t+0.36);
+}
+
+// ---------- Ambient scene soundscape (drone pad following the whole room) ----------
+let ambOn=false, ambNodes=null;
+function toggleAmbient(){
+  ambOn=!ambOn; document.getElementById('ambbtn').textContent='🌌 Soundscape: '+(ambOn?'on':'off');
+  if(ambOn){ if(!actx)actx=new (window.AudioContext||window.webkitAudioContext)(); actx.resume();
+    if(!ambNodes)ambNodes=buildAmbient(); ambNodes.master.gain.setTargetAtTime(0.16,actx.currentTime,2.0);
+  }else if(ambNodes){ ambNodes.master.gain.setTargetAtTime(0,actx.currentTime,1.2); }
+}
+function buildAmbient(){
+  const master=actx.createGain();master.gain.value=0;
+  const filt=actx.createBiquadFilter();filt.type='lowpass';filt.frequency.value=600;filt.Q.value=0.7;
+  const delay=actx.createDelay(1.0);delay.delayTime.value=0.42;
+  const fb=actx.createGain();fb.gain.value=0.42;
+  delay.connect(fb);fb.connect(delay);
+  filt.connect(master);filt.connect(delay);delay.connect(master);master.connect(actx.destination);
+  const root=110, ratios=[1,1.5,2,2.5,3];
+  ratios.forEach((r,i)=>{
+    const o=actx.createOscillator();o.type=(i%2)?'sine':'triangle';o.frequency.value=root*r;o.detune.value=(Math.random()*8-4);
+    const g=actx.createGain();g.gain.value=0.2/ratios.length;
+    const lfo=actx.createOscillator();lfo.frequency.value=0.05+i*0.021;
+    const lg=actx.createGain();lg.gain.value=0.12/ratios.length;
+    lfo.connect(lg);lg.connect(g.gain);lfo.start();
+    o.connect(g);g.connect(filt);o.start();
+  });
+  return {master,filt};
+}
+function updateAmbient(st){
+  if(!ambOn||!ambNodes||!actx)return;const t=actx.currentTime;
+  const mean=st.mean_mm||1500;                       // closer room -> brighter pad
+  ambNodes.filt.frequency.setTargetAtTime(300+(1-Math.min(mean,3500)/3500)*2600,t,0.9);
 }
 
 // ---------- Air-draw ----------
