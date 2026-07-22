@@ -38,6 +38,7 @@ import numpy as np
 import cv2
 
 from lidar_gestures import GestureEngine
+import lidar_calib
 
 # ---- sensor stream geometry (mirrors visualize_gpu.py) --------------------
 BINNING = int(os.environ.get("VL_BINNING", "2"))
@@ -54,6 +55,14 @@ MAX_MM = 4000
 PORT = int(os.environ.get("VL_PORT", "8080"))
 REC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
 ORIENT = 3
+
+
+# Per-zone calibration ray coefficients: point_mm = radial_mm * (kx,ky,kz).
+# Computed once; the browser fetches this via /rays.bin and multiplies each
+# zone's radial reading to render a geometrically correct cloud. Y is flipped
+# so +Y is up (screen convention).
+_kx, _ky, _kz = lidar_calib.ray_coeffs(RAW_W, RAW_H, BINNING)
+RAYS_BYTES = np.stack([_kx, -_ky, _kz], axis=2).astype("<f4").tobytes()
 
 
 def orient(a, m):
@@ -470,15 +479,16 @@ def heatmap_jpeg(depth, gesture, vision=False, scale=9):
 
 
 def make_ply(depth):
-    """ASCII PLY point cloud of the current frame, colored by depth (TURBO)."""
+    """ASCII PLY point cloud in TRUE Cartesian millimetres (ST radial->perp +
+    pointcloud calibration), colored by depth (TURBO)."""
+    Xc, Yc, Zc = lidar_calib.pointcloud(depth, BINNING)   # mm, real geometry
     ys, xs = np.nonzero((depth > 0) & (depth < MAX_MM))
     if xs.size == 0:
         ys, xs = np.array([0]), np.array([0])
     z = depth[ys, xs].astype(np.float32)
-    # World coords: x/y in zone units centred, z in cm toward the viewer.
-    X = (xs - RAW_W / 2.0)
-    Y = -(ys - RAW_H / 2.0)
-    Z = -(z / 20.0)
+    X = Xc[ys, xs]
+    Y = -Yc[ys, xs]        # flip so +Y is up in typical viewers
+    Z = Zc[ys, xs]         # perpendicular depth (mm), into the scene
     norm = np.clip(255.0 * (1.0 - z / MAX_MM), 0, 255).astype(np.uint8)
     rgb = cv2.applyColorMap(norm.reshape(-1, 1), cv2.COLORMAP_TURBO).reshape(-1, 3)[:, ::-1]
     n = xs.size
@@ -562,6 +572,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif path == "/depth.bin":
                 depth, _, _ = STUDIO.snapshot()
                 self._send(200, "application/octet-stream", depth.astype("<u2").tobytes())
+            elif path == "/rays.bin":
+                # per-zone (kx,ky,kz) calibration coefficients (float32), static
+                self._send(200, "application/octet-stream", RAYS_BYTES)
             elif path == "/snapshot.ply":
                 depth, _, _ = STUDIO.snapshot()
                 fn = time.strftime("lidar_%Y%m%d_%H%M%S.ply")
@@ -716,6 +729,7 @@ _PAGE = r"""<!doctype html>
     <div class="body">
       <div class="row">
         <button id="viewbtn" onclick="toggleView()">◎ View: Points</button>
+        <button id="calbtn" onclick="toggleCalib()">📐 Calibrated: on</button>
         <button id="spin">◔ Auto-spin: on</button>
         <button onclick="act('bg_reset')">⟳ Reset background</button>
       </div>
@@ -947,7 +961,20 @@ const qPos=gl.getAttribLocation(paintProg,'a_pos'), qCol=gl.getAttribLocation(pa
 const pBuf=gl.createBuffer(), mBuf=gl.createBuffer(), qBuf=gl.createBuffer();
 let nPoints=0, nMeshV=0, nPaint=0;
 const ok=z=>z>0&&z<MAX_MM;
-const wp=(c,r,z)=>[c-RAW_W/2, -(r-RAW_H/2), -(z/22.0-40.0)];
+// Calibration: RAYS holds per-zone (kx,ky,kz) so calibrated point =
+// radial*(k), i.e. TRUE Cartesian mm (ST radial->perp + pinhole model),
+// scaled to fit the view. Falls back to the stylized mapping until RAYS
+// loads or if the user turns calibration off.
+let RAYS=null, calibrated=true;
+const CS=0.0625, ZC=1500;   // mm->view scale, and depth centre (mm)
+fetch('/rays.bin').then(r=>r.arrayBuffer()).then(ab=>{RAYS=new Float32Array(ab);}).catch(()=>{});
+function toggleCalib(){calibrated=!calibrated;
+  document.getElementById('calbtn').textContent='📐 Calibrated: '+(calibrated?'on':'off');}
+function wp(c,r,z){
+  if(calibrated&&RAYS){const i=(r*RAW_W+c)*3;
+    return [z*RAYS[i]*CS, z*RAYS[i+1]*CS, -(z*RAYS[i+2]-ZC)*CS];}
+  return [c-RAW_W/2, -(r-RAW_H/2), -(z/22.0-40.0)];
+}
 
 function buildPoints(d){
   const arr=new Float32Array(RAW_W*RAW_H*4);let n=0;

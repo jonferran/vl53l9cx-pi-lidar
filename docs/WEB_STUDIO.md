@@ -30,7 +30,8 @@ otherwise-idle CPU cores, RAM, and disk to work.
 | **Record clip** | Capture the spinning 3D view to a downloadable **WebM video** (via the browser's MediaRecorder) — a shareable clip of your cloud. |
 | **Sentry mode** | Arm it and the studio becomes a **privacy-friendly smart camera**: it auto-records a depth clip whenever motion is detected and stops when the scene clears, with a timestamped **event log**. Captures *depth*, not video. |
 | **Record & replay** | One-click recording of the depth stream to disk (`.ldr` files), replayed right in the same UI. |
-| **PLY export** | Export the current frame as a standard **`.ply` point cloud** — plus an **HD snapshot** that temporally averages recent frames to denoise it. Opens in MeshLab, CloudCompare, Blender, or any online point-cloud viewer, and is easy to share. |
+| **PLY export** | Export the current frame as a standard **`.ply` point cloud** in **true Cartesian millimetres** (calibrated — see below) — plus an **HD snapshot** that temporally averages recent frames to denoise it. Opens in MeshLab, CloudCompare, Blender, or any online point-cloud viewer, and is easy to share. |
+| **Calibration** | The sensor reports *radial* distance; the studio applies **ST's radial→perpendicular + point-cloud transform** (pinhole focal length, principal point, K1–K4 distortion, emitter/receiver parallax) so the 3D view and every PLY are geometrically correct real-world millimetres, not fisheye-distorted radial depth. Toggle **Calibrated** on/off to see the difference. |
 
 Everything updates in real time and multiple devices can watch at once.
 

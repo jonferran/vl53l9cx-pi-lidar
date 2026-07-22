@@ -182,7 +182,10 @@ Things that were non-obvious and are baked into the code:
 
 ## Limitations / roadmap
 
-- Raw radial depth only — no calibration / radial-to-perpendicular / TNR (ST ISP)
+- Depth is raw radial off the wire; the **Web Studio** applies ST's
+  radial→perpendicular + point-cloud calibration (pinhole + distortion +
+  parallax, default OTP-fallback params) for geometrically correct 3D / PLY —
+  per-unit OTP calibration and TNR (ST ISP) are still not integrated
 - Amplitude & ambient arrays are decoded off the wire but not yet displayed
 - Sensor reset is a manual power-cycle (XSHUT is hard-tied on this board)
 
